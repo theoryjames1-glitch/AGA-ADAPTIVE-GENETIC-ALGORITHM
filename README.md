@@ -1,4 +1,6 @@
 # AGA-ADAPTIVE-GENETIC-ALGORITHM
+
+### AGA.py
 ```python
 # -*- coding: utf-8 -*-
 """
@@ -514,4 +516,209 @@ if __name__ == "__main__":
         if (t % args.print_every) == 0 or t in (1, args.steps):
             err = torch.linalg.norm(agent.theta.detach() - theta_star).item()
             _pretty_log(t, log, err)
+```
+
+### AGATest.py
+
+```python
+# tests/test_AGA.py
+import math
+import pytest
+import torch
+
+from AGA import AGAAgent, AGAConfig, AGAEnsemble
+
+DTYPE = torch.float64
+DEVICE = "cpu"
+
+
+# ---------- helpers ----------
+def quad(dim=2, A_diag=(3.0, 1.0), b_vals=(1.0, -2.0), *, device=DEVICE, dtype=DTYPE):
+    """Device/dtype-aware diagonal quadratic:
+       loss = 0.5 * theta^T diag(A_diag) theta - b^T theta
+       grad = diag(A_diag) theta - b
+    """
+    A = torch.diag(torch.tensor(A_diag[:dim], dtype=dtype, device=device))
+    b = torch.tensor(b_vals[:dim], dtype=dtype, device=device)
+
+    def loss_only(theta: torch.Tensor) -> torch.Tensor:
+        return 0.5 * (theta @ (A @ theta)) - (b @ theta)
+
+    def loss_and_grad(theta: torch.Tensor):
+        loss = 0.5 * (theta @ (A @ theta)) - (b @ theta)
+        grad = A @ theta - b
+        return loss, grad
+
+    theta_star = torch.linalg.solve(A, b)
+    return loss_only, loss_and_grad, theta_star
+
+
+# ---------- tests ----------
+def test_quadratic_converges_baseline_nonadaptive():
+    """Freeze adaptation so we get a crisp convergence assertion (< 1e-2 error)."""
+    loss_only, _, theta_star = quad(device=DEVICE, dtype=DTYPE)
+    cfg = AGAConfig(
+        adapt_alpha=False, adapt_mu=False, adapt_sigma=False,
+        alpha_min=1e-5, alpha_max=0.2, sigma_max=0.0,
+        ema_beta=0.95, param_noise=False,
+        dtype=DTYPE, device=DEVICE,
+    )
+    agent = AGAAgent(dim=2, config=cfg, seed=123, init_alpha=0.05, init_mu=0.0, init_sigma=0.0)
+    errs, losses = [], []
+    for _ in range(250):
+        log = agent.step(loss_only)
+        losses.append(log["loss"])
+        err = torch.linalg.norm(agent.theta.detach() - theta_star).item()
+        errs.append(err)
+
+    assert losses[-1] < losses[0], "final loss should be less than initial loss"
+    assert errs[-1] < errs[0], "final parameter error should be less than initial"
+    assert errs[-1] < 1e-2, f"final parameter error too large: {errs[-1]:.3e}"
+
+
+def test_adaptive_makes_progress():
+    """With adaptation on, we at least expect progress (looser assertion)."""
+    loss_only, _, _ = quad(device=DEVICE, dtype=DTYPE)
+    cfg = AGAConfig(
+        alpha_min=1e-5, alpha_max=0.2, sigma_max=0.0,
+        ema_beta=0.95, param_noise=False,
+        tau_alpha=0.0, tau_mu=0.0, tau_sigma=0.0,
+        max_delta_log_alpha=0.25, max_delta_log_sigma=0.25,
+        dtype=DTYPE, device=DEVICE,
+    )
+    agent = AGAAgent(dim=2, config=cfg, seed=123, init_alpha=0.05, init_mu=0.0, init_sigma=0.0)
+    losses = []
+    for _ in range(250):
+        losses.append(agent.step(loss_only)["loss"])
+    assert losses[-1] < losses[0]
+
+
+def test_bounds_and_clamps_and_gamma_present():
+    """Ensure coefficients remain within bounds and gamma is reported."""
+    loss_only, _, _ = quad(device=DEVICE, dtype=DTYPE)
+    cfg = AGAConfig(
+        alpha_min=1e-5, alpha_max=0.1, sigma_max=0.1,
+        max_delta_log_alpha=0.1, max_delta_log_sigma=0.1,
+        tau_alpha=0.0, tau_mu=0.0, tau_sigma=0.0,
+        ema_beta=0.95, param_noise=False,
+        dtype=DTYPE, device=DEVICE,
+    )
+    agent = AGAAgent(dim=2, config=cfg, seed=0, init_alpha=0.05)
+    for _ in range(120):
+        log = agent.step(loss_only)
+        assert cfg.alpha_min <= agent.alpha <= cfg.alpha_max
+        assert 0.0 <= agent.mu < 1.0
+        assert 0.0 <= agent.sigma <= cfg.sigma_max
+        assert "gamma" in log and log["gamma"] >= 0.0
+
+
+def test_consensus_reclip():
+    """Start some agents outside bounds; after consensus they should be clipped and within bounds."""
+    loss_only, _, _ = quad(device=DEVICE, dtype=DTYPE)
+    cfg = AGAConfig(
+        alpha_min=1e-5, alpha_max=0.05, sigma_max=0.05,
+        ema_beta=0.9, param_noise=False,
+        dtype=DTYPE, device=DEVICE,
+    )
+    agents = [
+        AGAAgent(dim=2, config=cfg, seed=1, init_alpha=0.05),
+        AGAAgent(dim=2, config=cfg, seed=2, init_alpha=0.10),  # above max initially
+        AGAAgent(dim=2, config=cfg, seed=3, init_alpha=1e-6),  # below min initially
+    ]
+    ens = AGAEnsemble(agents, config=cfg)
+    for _ in range(60):
+        summary = ens.step(loss_only)
+        for a in ens.agents:
+            assert cfg.alpha_min <= a.alpha <= cfg.alpha_max
+            assert 0.0 <= a.mu < 1.0
+            assert 0.0 <= a.sigma <= cfg.sigma_max
+        assert "bar_alpha" in summary
+
+
+def test_phi_hook_identity_and_mismatch():
+    calls = {"n": 0}
+
+    def phi(s: torch.Tensor) -> torch.Tensor:
+        calls["n"] += 1
+        out = s.clone()
+        out[1] = 2.0 * out[1]  # simple feature tweak
+        return out
+
+    cfg = AGAConfig(phi=phi, ema_beta=0.9, param_noise=False, dtype=DTYPE, device=DEVICE)
+    agent = AGAAgent(dim=2, config=cfg, seed=0)
+    loss_only, _, _ = quad(device=DEVICE, dtype=DTYPE)
+    agent.step(loss_only)
+    assert calls["n"] == 1, "phi() should be called once"
+
+    # Now a deliberate mismatch: phi returns 5-dim, but k_* are length-4
+    def phi_bad(s: torch.Tensor) -> torch.Tensor:
+        return torch.cat([s, torch.tensor([0.0], dtype=s.dtype, device=s.device)], dim=0)
+
+    cfg_bad = AGAConfig(phi=phi_bad, dtype=DTYPE, device=DEVICE)
+    agent_bad = AGAAgent(dim=2, config=cfg_bad)
+    with pytest.raises(ValueError):
+        agent_bad.step(loss_only)
+
+
+def test_nonfinite_guard_raises():
+    cfg = AGAConfig(param_noise=False, dtype=DTYPE, device=DEVICE)
+    agent = AGAAgent(dim=2, config=cfg, seed=0)
+
+    class LossMaker:
+        def __init__(self):
+            self.t = 0
+        def __call__(self, theta: torch.Tensor):
+            self.t += 1
+            if self.t == 5:
+                # return a NaN loss to trigger the guard
+                return torch.tensor(float("nan"), dtype=DTYPE, device=theta.device)
+            # simple squared norm loss (no grad provided, uses autograd)
+            return 0.5 * torch.dot(theta, theta)
+
+    lm = LossMaker()  # <-- instantiate once
+    with pytest.raises(FloatingPointError):
+        for _ in range(10):
+            agent.step(lm)
+
+
+def test_tuple_loss_grad_path():
+    _, loss_and_grad, _ = quad(device=DEVICE, dtype=DTYPE)
+    cfg = AGAConfig(param_noise=False, dtype=DTYPE, device=DEVICE)
+    agent = AGAAgent(dim=2, config=cfg, seed=0)
+    # Should run without error when (loss, grad) tuple is provided
+    for _ in range(5):
+        log = agent.step(loss_and_grad)
+        assert "grad_norm" in log and log["grad_norm"] >= 0.0
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+def test_cuda_single_step():
+    device = "cuda"
+    loss_only, _, _ = quad(device=device, dtype=torch.float64)
+    cfg = AGAConfig(param_noise=False, device=device, dtype=torch.float64)
+    agent = AGAAgent(dim=2, config=cfg, seed=0, device=device, dtype=torch.float64)
+    log = agent.step(loss_only)
+    assert math.isfinite(log["loss"])
+
+
+def test_grad_clipping_applied():
+    """Verify grad clipping limits the reported grad norm."""
+    loss_only, _, _ = quad(device=DEVICE, dtype=DTYPE)
+    cfg = AGAConfig(param_noise=False, dtype=DTYPE, device=DEVICE, clip_grad_norm=1.0,
+                    adapt_alpha=False, adapt_mu=False, adapt_sigma=False)
+    agent = AGAAgent(dim=2, config=cfg, seed=0, init_alpha=0.05)
+    log = agent.step(loss_only)
+    assert log["grad_norm"] <= 1.0 + 1e-12
+
+
+def test_update_alias_calls_step():
+    """Ensure .update() alias is present and returns a log dict like .step()."""
+    loss_only, _, _ = quad(device=DEVICE, dtype=DTYPE)
+    cfg = AGAConfig(param_noise=False, dtype=DTYPE, device=DEVICE,
+                    adapt_alpha=False, adapt_mu=False, adapt_sigma=False)
+    agent = AGAAgent(dim=2, config=cfg, seed=0, init_alpha=0.05)
+    log1 = agent.step(loss_only)
+    log2 = agent.update(loss_only)
+    for k in ("loss", "alpha", "mu", "sigma", "gamma"):
+        assert k in log1 and k in log2
 ```
